@@ -43,7 +43,11 @@ void set_params_fprop(Flash_fwd_params &params,
                       float softmax_scale,
                       int window_size_left,
                       int window_size_right,
-                      bool seqlenq_ngroups_swapped=false) {
+                      bool seqlenq_ngroups_swapped=false,
+                      int num_local_tokens=0,
+                      int attn_scores_rows=0,
+                      int attn_scores_cols=0,
+                      void *attn_scores_d=nullptr) {
 
     // Reset the parameters
     params = {};
@@ -82,6 +86,11 @@ void set_params_fprop(Flash_fwd_params &params,
 
     // P = softmax(QK^T)
     params.p_ptr = p_d;
+
+    params.num_local_tokens = num_local_tokens;
+    params.attn_scores_rows = attn_scores_rows;
+    params.attn_scores_cols = attn_scores_cols;
+    params.attn_scores_ptr = attn_scores_d;
 
     // Softmax sum
     params.softmax_lse_ptr = softmax_lse_d;
@@ -143,6 +152,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
             if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
                 run_mha_fwd_<elem_type, kHeadDim>(params, stream);
             } else {
+                // printf("split\n");
                 run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim>(params, stream);
             }
         });
@@ -438,6 +448,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                int window_size_left,
                int window_size_right,
                const bool return_softmax,
+               const int num_local_tokens,
+               const bool return_attn_scores,
                c10::optional<at::Generator> gen_) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -583,6 +595,18 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         p = torch::empty({ batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded }, opts);
     }
 
+    at::Tensor attn_scores;
+    if (return_attn_scores) {
+        int kBlockM = 64;
+        int attn_scores_rows = round_multiple(max_seqlen_q, kBlockM);
+        attn_scores_rows = std::min(seqlen_q_rounded, attn_scores_rows);
+        int kBlockN = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
+        int attn_scores_cols = round_multiple(max_seqlen_q + num_local_tokens - 1, kBlockN);
+        attn_scores_cols = std::min(seqlen_k_rounded, attn_scores_cols);
+        printf("attn scores row: %d, cols: %d\n", attn_scores_rows, attn_scores_cols);
+        attn_scores = torch::empty({ batch_size, num_heads, attn_scores_rows, attn_scores_cols }, opts);
+    }
+
     if (zero_tensors) {
         out.zero_();
         softmax_lse.fill_(-std::numeric_limits<float>::infinity());
@@ -606,7 +630,11 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      softmax_scale,
                      window_size_left,
                      window_size_right,
-                     seqlenq_ngroups_swapped);
+                     seqlenq_ngroups_swapped,
+                     num_local_tokens,
+                     return_attn_scores ? attn_scores.sizes()[2] : 0,
+                     return_attn_scores ? attn_scores.sizes()[3] : 0,
+                     return_attn_scores ? attn_scores.data_ptr() : nullptr);
 
     if (paged_KV) {
         params.block_table = block_table.data_ptr<int>();
@@ -665,7 +693,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * max_seqlen_q, 1});
     }
 
-    return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state};
+    return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state, attn_scores};
 }
 
 std::vector<at::Tensor>

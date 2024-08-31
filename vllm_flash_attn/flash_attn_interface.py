@@ -79,13 +79,15 @@ def _flash_attn_varlen_forward(
     window_size,
     alibi_slopes,
     return_softmax,
+    num_local_tokens,
+    return_attn_scores,
     block_table,
     *,
     out=None
 ):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = flash_attn_cuda.varlen_fwd(
+    out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state, attn_scores = flash_attn_cuda.varlen_fwd(
         q,
         k,
         v,
@@ -104,11 +106,13 @@ def _flash_attn_varlen_forward(
         window_size[0],
         window_size[1],
         return_softmax,
+        num_local_tokens,
+        return_attn_scores,
         None,
     )
     # if out.isnan().any() or softmax_lse.isnan().any():
     #     breakpoint()
-    return out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state
+    return out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state, attn_scores
 
 
 def _flash_attn_backward(
@@ -588,12 +592,14 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         alibi_slopes,
         deterministic,
         return_softmax,
+        num_local_tokens,
+        return_attn_scores,
         block_table,
         out=None,
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
-        out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
+        out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state, attn_scores = _flash_attn_varlen_forward(
             q,
             k,
             v,
@@ -607,6 +613,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             window_size=window_size,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
+            num_local_tokens=num_local_tokens,
+            return_attn_scores=return_attn_scores,
             block_table=block_table,
             out=out,
         )
@@ -621,6 +629,11 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.window_size = window_size
         ctx.alibi_slopes = alibi_slopes
         ctx.deterministic = deterministic
+        if return_attn_scores:
+            if return_softmax:
+                return (out, softmax_lse, S_dmask, attn_scores)
+            else:
+                return (out, attn_scores)
         return out if not return_softmax else (out, softmax_lse, S_dmask)
 
     @staticmethod
@@ -1038,6 +1051,8 @@ def flash_attn_varlen_func(
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
+    num_local_tokens=0,
+    return_attn_scores=False,
     block_table=None,
     *,
     out=None,
@@ -1111,6 +1126,8 @@ def flash_attn_varlen_func(
         alibi_slopes,
         deterministic,
         return_attn_probs,
+        num_local_tokens,
+        return_attn_scores,
         block_table,
         out,
     )

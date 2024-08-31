@@ -1,0 +1,20 @@
+{
+    "configurations": [
+      {
+        "name": "Linux",
+        "includePath": [
+            "${workspaceFolder}/**",
+            "/usr/local/cuda/include/",
+            "/home/ubuntu/projects/flash-attention/csrc/flash_attn/**",
+            "/home/ubuntu/projects/flash-attention/csrc/flash_attn/src/**",
+        ],
+        "defines": [],
+        "compilerPath": "/usr/bin/gcc",
+        "cStandard": "gnu11",
+        "cppStandard": "gnu++17",
+        "intelliSenseMode": "linux-gcc-x64",
+        "configurationProvider": "ms-vscode.cpptools"
+      }
+    ],
+    "version": 4
+  }
