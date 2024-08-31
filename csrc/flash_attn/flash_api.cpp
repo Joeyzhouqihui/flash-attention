@@ -599,11 +599,10 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     if (return_attn_scores) {
         int kBlockM = 64;
         int attn_scores_rows = round_multiple(max_seqlen_q, kBlockM);
-        attn_scores_rows = std::min(seqlen_q_rounded, attn_scores_rows);
         int kBlockN = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
-        int attn_scores_cols = round_multiple(max_seqlen_q + num_local_tokens - 1, kBlockN);
-        attn_scores_cols = std::min(seqlen_k_rounded, attn_scores_cols);
-        printf("attn scores row: %d, cols: %d\n", attn_scores_rows, attn_scores_cols);
+        int attn_scores_cols = std::min(max_seqlen_k, attn_scores_rows + num_local_tokens - 1);
+        attn_scores_cols = round_multiple(attn_scores_cols, kBlockN);
+        // printf("attn scores row: %d, cols: %d\n", attn_scores_rows, attn_scores_cols);
         attn_scores = torch::empty({ batch_size, num_heads, attn_scores_rows, attn_scores_cols }, opts);
     }
 

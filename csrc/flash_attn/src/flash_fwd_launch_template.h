@@ -100,7 +100,7 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
     dim3 grid(num_m_block, params.num_splits > 1 ? params.num_splits : params.b, params.num_splits > 1 ? params.b * params.h : params.h);
-    printf("num_split: %d, grid x: %d, y: %d, z: %d\n", params.num_splits, grid.x, grid.y, grid.z);
+    // printf("num_split: %d, grid x: %d, y: %d, z: %d\n", params.num_splits, grid.x, grid.y, grid.z);
     const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_k % Kernel_traits::kBlockN == 0 && params.seqlen_q % Kernel_traits::kBlockM == 0;
     const bool is_even_K = params.d == Kernel_traits::kHeadDim;
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
@@ -163,7 +163,7 @@ void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream)
     // and for headdim 192 with block size 64 x 128.
     // Also for headdim 160 with block size 64 x 128 after the rotary addition.
     constexpr static int kBlockN = Headdim <= 64 ? 256 : (Headdim <= 128 ? 128 : 64);
-    printf("kBlockM: %d, kBlockN: %d\n", kBlockM, kBlockN);
+    // printf("kBlockM: %d, kBlockN: %d\n", kBlockM, kBlockN);
     run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>>(params, stream);
 }
 
