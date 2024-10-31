@@ -24,6 +24,7 @@ __device__ __forceinline__ void thread_reduce_(Tensor<Engine0, Layout0> const &t
     static_assert(Layout0::rank == 2, "Only support 2D Tensor");
     static_assert(Layout1::rank == 1, "Only support 1D Tensor");
     CUTE_STATIC_ASSERT_V(size<0>(summary) == size<0>(tensor));
+    // printf("%d, %d\n", int(size<0>(tensor)), int(size<1>(tensor)));
     #pragma unroll
     for (int mi = 0; mi < size<0>(tensor); mi++) {
         summary(mi) = zero_init ? tensor(mi, 0) : op(summary(mi), tensor(mi, 0));

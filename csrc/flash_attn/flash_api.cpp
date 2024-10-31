@@ -47,7 +47,10 @@ void set_params_fprop(Flash_fwd_params &params,
                       int num_local_tokens=0,
                       int attn_scores_rows=0,
                       int attn_scores_cols=0,
-                      void *attn_scores_d=nullptr) {
+                      void *attn_scores_d=nullptr,
+                      bool reduce_attn_scores=false,
+                      bool is_prefill=false,
+                      int ngroups=1) {
 
     // Reset the parameters
     params = {};
@@ -91,6 +94,9 @@ void set_params_fprop(Flash_fwd_params &params,
     params.attn_scores_rows = attn_scores_rows;
     params.attn_scores_cols = attn_scores_cols;
     params.attn_scores_ptr = attn_scores_d;
+    params.reduce_attn_scores = reduce_attn_scores;
+    params.is_prefill = is_prefill;
+    params.ngroups = ngroups;
 
     // Softmax sum
     params.softmax_lse_ptr = softmax_lse_d;
@@ -450,6 +456,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                const bool return_softmax,
                const int num_local_tokens,
                const bool return_attn_scores,
+               const bool reduce_attn_scores,
                c10::optional<at::Generator> gen_) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -509,7 +516,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
-    const int seqlenq_ngroups_swapped = max_seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size_og % 8 == 0 && !alibi_slopes_.has_value();
+    // const int seqlenq_ngroups_swapped = max_seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size_og % 8 == 0 && !alibi_slopes_.has_value();
+    const int seqlenq_ngroups_swapped = false;
     const int ngroups = num_heads / num_heads_k;
     if (seqlenq_ngroups_swapped) {
         q = q.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2).reshape({batch_size * ngroups, num_heads_k, head_size_og});
@@ -596,13 +604,21 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     }
 
     at::Tensor attn_scores;
-    if (return_attn_scores) {
+    if (return_attn_scores && !reduce_attn_scores) {
         int kBlockM = 64;
         int attn_scores_rows = round_multiple(max_seqlen_q, kBlockM);
         int kBlockN = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
-        int attn_scores_cols = std::min(max_seqlen_k, attn_scores_rows + num_local_tokens - 1);
-        attn_scores_cols = round_multiple(attn_scores_cols, kBlockN);
+        // int attn_scores_cols = std::min(max_seqlen_k, max_seqlen_q + num_local_tokens - 1);
+        int attn_scores_cols = round_multiple(max_seqlen_k, kBlockN);
         // printf("attn scores row: %d, cols: %d\n", attn_scores_rows, attn_scores_cols);
+        attn_scores = torch::empty({ batch_size, num_heads, attn_scores_rows, attn_scores_cols }, opts);
+    } else if (return_attn_scores && reduce_attn_scores) {
+        int kBlockM = 64;
+        int attn_scores_rows = round_multiple(max_seqlen_q, kBlockM) / kBlockM;
+        int kBlockN = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
+        // int attn_scores_cols = std::min(max_seqlen_k, max_seqlen_q + num_local_tokens - 1);
+        // attn_scores_cols = round_multiple(attn_scores_cols, kBlockN);
+        int attn_scores_cols = round_multiple(max_seqlen_k, kBlockN);
         attn_scores = torch::empty({ batch_size, num_heads, attn_scores_rows, attn_scores_cols }, opts);
     }
 
@@ -633,7 +649,10 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      num_local_tokens,
                      return_attn_scores ? attn_scores.sizes()[2] : 0,
                      return_attn_scores ? attn_scores.sizes()[3] : 0,
-                     return_attn_scores ? attn_scores.data_ptr() : nullptr);
+                     return_attn_scores ? attn_scores.data_ptr() : nullptr,
+                     reduce_attn_scores,
+                     true,
+                     ngroups);
 
     if (paged_KV) {
         params.block_table = block_table.data_ptr<int>();
@@ -683,6 +702,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         if (out_.has_value()) { out_.value().copy_(out); }
     }
 
+    // printf("seqlenq_ngroups_swapped: %d\n", seqlenq_ngroups_swapped);
     if (seqlenq_ngroups_swapped) {
         int64_t size_before[] = {batch_size, max_seqlen_q, num_heads_k, head_size_og};
         int64_t size_after[] = {batch_size, num_heads_k * max_seqlen_q, head_size_og};
@@ -690,6 +710,11 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         out_padded = out_padded.reshape(size_before).transpose(1, 2).reshape(size_after);
         q_padded = q_padded.reshape(size_before).transpose(1, 2).reshape(size_after);
         softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * max_seqlen_q, 1});
+        if (return_attn_scores) {
+            int64_t size_before[] = {batch_size, ngroups, num_heads_k, params.attn_scores_rows, params.attn_scores_cols};
+            int64_t size_after[] = {batch_size, ngroups * num_heads_k, params.attn_scores_rows, params.attn_scores_cols};
+            attn_scores = attn_scores.reshape(size_before).transpose(1, 2).reshape(size_after);
+        }
     }
 
     return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state, attn_scores};
@@ -713,7 +738,10 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                 int window_size_left,
                 int window_size_right,
                 bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-                int num_splits
+                int num_splits,
+                int num_local_tokens,
+                bool return_attn_scores,
+                bool reduce_attn_scores
                 ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -753,6 +781,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     const int batch_size = sizes[0];
     int seqlen_q = sizes[1];
+    TORCH_CHECK(seqlen_q == 1, "Decode requests must have seqlen_q == 1");
     const int seqlen_q_og = seqlen_q;
     int num_heads = sizes[2];
     const int num_heads_og = num_heads;
@@ -776,8 +805,10 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
     const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && head_size_og % 8 == 0 && !alibi_slopes_.has_value();
+    // TORCH_CHECK(seqlenq_ngroups_swapped == 1, "decode must swap ngroup and kvhead");
+    const int ngroups = num_heads / num_heads_k;
+    TORCH_CHECK(ngroups <= 64, "ngroups must be less than 64");
     if (seqlenq_ngroups_swapped) {
-        const int ngroups = num_heads / num_heads_k;
         q = q.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2);
         seqlen_q = ngroups;
         num_heads = num_heads_k;
@@ -837,6 +868,20 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
 
+    at::Tensor attn_scores;
+    if (return_attn_scores && !reduce_attn_scores) {
+        int kBlockM = 64;
+        int attn_scores_rows = round_multiple(ngroups, kBlockM);
+        int kBlockN = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
+        int attn_scores_cols = round_multiple(seqlen_k, kBlockN);
+        attn_scores = torch::empty({ batch_size, num_heads, attn_scores_rows, attn_scores_cols }, opts);
+    } else if (return_attn_scores && reduce_attn_scores) {
+        int attn_scores_rows = ngroups;
+        int kBlockN = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
+        int attn_scores_cols = round_multiple(seqlen_k, kBlockN);
+        attn_scores = torch::empty({ batch_size, num_heads, attn_scores_rows, attn_scores_cols }, opts);
+    }
+
     Flash_fwd_params params;
     set_params_fprop(params,
                      batch_size,
@@ -853,7 +898,15 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      /*p_dropout=*/0.f,
                      softmax_scale,
                      window_size_left,
-                     window_size_right);
+                     window_size_right,
+                     false,
+                     num_local_tokens,
+                     return_attn_scores ? attn_scores.sizes()[2] : 0,
+                     return_attn_scores ? attn_scores.sizes()[3] : 0,
+                     return_attn_scores ? attn_scores.data_ptr() : nullptr,
+                     reduce_attn_scores,
+                     false,
+                     ngroups);
 
     at::Tensor k, v, k_padded, v_padded;
     if (k_.has_value()) {
@@ -966,7 +1019,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         out = out.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_og});
         softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
     }
-    return {out, softmax_lse};
+    return {out, softmax_lse, attn_scores};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

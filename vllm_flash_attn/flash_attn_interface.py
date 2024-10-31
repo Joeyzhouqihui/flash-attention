@@ -81,6 +81,7 @@ def _flash_attn_varlen_forward(
     return_softmax,
     num_local_tokens,
     return_attn_scores,
+    reduce_attn_scores,
     block_table,
     *,
     out=None
@@ -108,6 +109,7 @@ def _flash_attn_varlen_forward(
         return_softmax,
         num_local_tokens,
         return_attn_scores,
+        reduce_attn_scores,
         None,
     )
     # if out.isnan().any() or softmax_lse.isnan().any():
@@ -594,6 +596,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         return_softmax,
         num_local_tokens,
         return_attn_scores,
+        reduce_attn_scores,
         block_table,
         out=None,
     ):
@@ -615,6 +618,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             return_softmax=return_softmax and dropout_p > 0,
             num_local_tokens=num_local_tokens,
             return_attn_scores=return_attn_scores,
+            reduce_attn_scores=reduce_attn_scores,
             block_table=block_table,
             out=out,
         )
@@ -1053,6 +1057,7 @@ def flash_attn_varlen_func(
     return_attn_probs=False,
     num_local_tokens=0,
     return_attn_scores=False,
+    reduce_attn_scores=False,
     block_table=None,
     *,
     out=None,
@@ -1128,6 +1133,7 @@ def flash_attn_varlen_func(
         return_attn_probs,
         num_local_tokens,
         return_attn_scores,
+        reduce_attn_scores,
         block_table,
         out,
     )
@@ -1150,6 +1156,9 @@ def flash_attn_with_kvcache(
     rotary_interleaved=True,
     alibi_slopes=None,
     num_splits=0,
+    num_local_tokens=0,
+    return_attn_scores=False,
+    reduce_attn_scores=False,
     *,
     out=None,
 ):
@@ -1247,7 +1256,7 @@ def flash_attn_with_kvcache(
         cache_seqlens = maybe_contiguous(cache_seqlens)
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
     block_table = maybe_contiguous(block_table)
-    out, softmax_lse = flash_attn_cuda.fwd_kvcache(
+    out, softmax_lse, attn_scores = flash_attn_cuda.fwd_kvcache(
         q,
         k_cache,
         v_cache,
@@ -1266,5 +1275,10 @@ def flash_attn_with_kvcache(
         window_size[1],
         rotary_interleaved,
         num_splits,
+        num_local_tokens,
+        return_attn_scores,
+        reduce_attn_scores,
     )
-    return out
+    if return_attn_scores:
+        return out, softmax_lse, attn_scores
+    return out, softmax_lse

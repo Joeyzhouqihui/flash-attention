@@ -491,7 +491,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     using index_t = typename Kernel_traits::index_t;
 
     // Shared memory.
-    extern __shared__ char smem_[];
+    extern __shared__ char smem_org_[];
+    char *smem_ = smem_org_;
 
     // The thread index.
     const int tidx = threadIdx.x;
@@ -500,6 +501,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     constexpr int kBlockN = Kernel_traits::kBlockN;
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
     constexpr int kNWarps = Kernel_traits::kNWarps;
+
+    bool Return_attn_scores = (params.attn_scores_ptr != nullptr);
+    bool Reduce_attn_scores = params.reduce_attn_scores;
+    if (Return_attn_scores && Reduce_attn_scores && params.is_prefill) {
+        smem_ += sizeof(float) * kBlockN * kNWarps;
+    }
+    // shape <kNWarps, kBlockM>
+    float *attn_scores_warp_buffer = reinterpret_cast<float*>(smem_org_);
+
 
     using GmemTiledCopyO = std::conditional_t<
         !Split,
@@ -582,9 +592,18 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     // const index_t row_offset_as = ((bidb * params.h + bidh) * params.seqlen_q_rounded
     //     + m_block * kBlockM) * params.seqlen_k_rounded + (n_block_max - 1) * kBlockN;
-    int n_block_max_local = std::min(cute::ceil_div(params.attn_scores_cols, kBlockN), n_block_max);
+    // int n_block_max_local = std::min(cute::ceil_div(params.attn_scores_cols, kBlockN), n_block_max);
+    // const index_t row_offset_as = ((bidb * params.h + bidh) * params.attn_scores_rows
+    //     + m_block * kBlockM) * params.attn_scores_cols + (n_block_max - 1) * kBlockN;
+
+    const int n_block_max_global = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
     const index_t row_offset_as = ((bidb * params.h + bidh) * params.attn_scores_rows
-        + m_block * kBlockM) * params.attn_scores_cols + (n_block_max_local - 1) * kBlockN;
+        + m_block * kBlockM) * params.attn_scores_cols;
+    // const index_t row_offset_as_reduce = ((bidb * params.h + bidh) * params.attn_scores_rows
+    //     + m_block) * params.attn_scores_cols + (n_block_max - 1) * kBlockN;
+    // assert(m_block == 0);
+    const index_t row_offset_as_reduce = ((bidb * params.h + bidh) * params.attn_scores_rows
+        + m_block) * params.attn_scores_cols;
 
     // if (threadIdx.x == 0) {
     //     printf("block: %d %d %d, bidb: %d, bidh: %d, n_block_max: %d, offset: %ld\n", 
@@ -612,6 +631,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor gAS = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.attn_scores_ptr) + row_offset_as),
                              Shape<Int<kBlockM>, Int<kBlockN>>{},
                              make_stride(params.attn_scores_cols, _1{}));
+    Element *gAS_reduce_ptr = reinterpret_cast<Element *>(params.attn_scores_ptr) + row_offset_as_reduce;
     
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                             typename Kernel_traits::SmemLayoutQ{});
@@ -651,8 +671,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor tSrK  = thr_mma.partition_fragment_B(sK);                           // (MMA,MMA_N,MMA_K)
     Tensor tOrVt  = thr_mma.partition_fragment_B(sVtNoSwizzle);                // (MMA, MMA_K,MMA_N)
 
-    bool Return_attn_scores = (params.attn_scores_ptr != nullptr);
-    int attn_scores_cols = params.attn_scores_cols;
+    const int attn_scores_cols = params.attn_scores_cols;
+    const int num_local_tokens = params.num_local_tokens;
     Tensor tSgAS = thr_mma.partition_C(gAS);
 
     Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_M, MMA_K
@@ -875,6 +895,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     const float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
     flash::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
+    int query_token_offset;
+    if (params.is_prefill) {
+        query_token_offset = binfo.actual_seqlen_k - binfo.actual_seqlen_q;
+    } else {
+        query_token_offset = binfo.actual_seqlen_k - 1;
+    }
+    // if (threadIdx.x == 0 && blockIdx.x == 0) {
+    //     printf("query_token_offset: %d, num_local_tokens: %d\n", query_token_offset, num_local_tokens);
+    // }
 
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.
@@ -940,10 +969,51 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             cute::cp_async_fence();
         }
 
-        if (Return_attn_scores && attn_scores_cols > n_block * kBlockN) {
+        if (Return_attn_scores && !Reduce_attn_scores) {
             Tensor rAS = flash::convert_type<Element>(acc_s);
+            tSgAS.data() = tSgAS.data() + n_block * kBlockN;
             cute::copy(rAS, tSgAS);
-            tSgAS.data() = tSgAS.data() + (-kBlockN);
+            tSgAS.data() = tSgAS.data() + (-(n_block * kBlockN));
+        } else if (Return_attn_scores && Reduce_attn_scores) {
+            if (params.is_prefill) {
+                const int min_real_col = n_block * kBlockN;
+                const int max_real_col = min_real_col + kBlockN - 1;
+                const int min_real_row = m_block * kBlockM + query_token_offset;
+                const int max_real_row = min_real_row + kBlockM - 1;
+                if (min_real_col <= max_real_row // not totally musked and within local window
+                    && min_real_row - max_real_col < num_local_tokens) {
+                    gAS_reduce_ptr += min_real_col;
+                    flash::col_reduce_prefill<kNWarps, kBlockN, Element>(
+                        gAS_reduce_ptr, 
+                        acc_s, 
+                        attn_scores_warp_buffer,
+                        min_real_col,
+                        min_real_row,
+                        kNWarps * 16,
+                        num_local_tokens,
+                        binfo.actual_seqlen_k,
+                        binfo.actual_seqlen_k
+                    );
+                    gAS_reduce_ptr -= min_real_col;
+                }
+            } else {
+                const int min_real_col = n_block * kBlockN;
+                const int max_real_col = min_real_col + kBlockN - 1;
+                const int real_row = query_token_offset;
+                if (real_row - max_real_col < num_local_tokens) {
+                    flash::col_reduce_decode<kBlockN, Element>(
+                        gAS_reduce_ptr,
+                        params.ngroups,
+                        attn_scores_cols,
+                        acc_s,
+                        min_real_col,
+                        real_row,
+                        kNWarps * 16,
+                        num_local_tokens,
+                        binfo.actual_seqlen_k
+                    );
+                }
+            }
         }
 
         // We have key_padding_mask so we'll need to Check_inf
@@ -1008,12 +1078,53 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
         );
 
-        if (Return_attn_scores && attn_scores_cols > n_block * kBlockN) {
+        if (Return_attn_scores && !Reduce_attn_scores) {
             Tensor rAS = flash::convert_type<Element>(acc_s);
+            tSgAS.data() = tSgAS.data() + n_block * kBlockN;
             cute::copy(rAS, tSgAS);
-            tSgAS.data() = tSgAS.data() + (-kBlockN);
+            tSgAS.data() = tSgAS.data() + (-(n_block * kBlockN));
+        } else if (Return_attn_scores && Reduce_attn_scores) {
+            if (params.is_prefill) {
+                const int min_real_col = n_block * kBlockN;
+                const int max_real_col = min_real_col + kBlockN - 1;
+                const int min_real_row = m_block * kBlockM + query_token_offset;
+                const int max_real_row = min_real_row + kBlockM - 1;
+                if (min_real_col <= max_real_row // not totally musked and within local window
+                    && min_real_row - max_real_col < num_local_tokens) {
+                    gAS_reduce_ptr += min_real_col;
+                    flash::col_reduce_prefill<kNWarps, kBlockN, Element>(
+                        gAS_reduce_ptr, 
+                        acc_s, 
+                        attn_scores_warp_buffer,
+                        min_real_col,
+                        min_real_row, 
+                        kNWarps * 16,
+                        num_local_tokens,
+                        binfo.actual_seqlen_k,
+                        binfo.actual_seqlen_k
+                    );
+                    gAS_reduce_ptr -= min_real_col;
+                }
+            } else {
+                const int min_real_col = n_block * kBlockN;
+                const int max_real_col = min_real_col + kBlockN - 1;
+                const int real_row = query_token_offset;
+                if (real_row - max_real_col < num_local_tokens) {
+                    flash::col_reduce_decode<kBlockN, Element>(
+                        gAS_reduce_ptr,
+                        params.ngroups,
+                        attn_scores_cols,
+                        acc_s,
+                        min_real_col,
+                        real_row,
+                        kNWarps * 16,
+                        num_local_tokens,
+                        binfo.actual_seqlen_k
+                    );
+                }
+            }
         }
-
+        
         softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
 
         Tensor rP = flash::convert_type<Element>(acc_s);

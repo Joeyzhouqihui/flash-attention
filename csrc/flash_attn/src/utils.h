@@ -21,6 +21,7 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
+#include <cuda_fp16.h>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -189,6 +190,126 @@ __forceinline__ __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {
     static_assert(decltype(rank(acc_layout))::value == 3);
     auto l = logical_divide(acc_layout, Shape<_2>{});  // ((2, 2), MMA_M, MMA_N)
     return make_layout(make_layout(get<0, 1>(l), get<1>(l)), make_layout(get<0, 0>(l), get<2>(l)));
+};
+
+template<int kNWarps, int kCols, typename Element, typename Engine, typename Layout>
+__forceinline__ __device__ void col_reduce_prefill(Element *dst, 
+                                                    Tensor<Engine, Layout> &tensor_, 
+                                                    float *warp_buffer,
+                                                    const int col_idx_offset,
+                                                    const int row_idx_offset,
+                                                    const int warp_row_stride,
+                                                    const int num_local_tokens,
+                                                    const int max_row,
+                                                    const int max_col) {
+    // Reshape tensor_ from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
+    Tensor tensor = make_tensor(tensor_.data(), flash::convert_layout_acc_rowcol(tensor_.layout()));
+    // if (threadIdx.x == 0) {
+    //     printf("%d, %d\n", kRows, kCols);
+    //     printf("%d, %d, %d\n", int(size<0>(data)), int(size<1>(data)), int(size<2>(data)));
+    //     printf("%d, %d, %d, %d\n", int(size<0, 0>(src)), int(size<0, 1>(src)), int(size<1, 0>(src)), int(size<1, 1>(src)));
+    // }
+    const int num_threads = blockDim.x;
+    const int thread_id = threadIdx.x;
+    const int warp_id = thread_id / 32;
+    const int lane_id = thread_id % 32;
+
+    const int warp_buffer_offset = warp_id * kCols;
+    const int row_base = (thread_id / 32) * 16 + (thread_id % 32) / 4;
+    const int col_base = (lane_id % 4) * 2;
+    // 0 ~ 15
+#pragma unroll
+    for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+        // 0 ~ 1
+#pragma unroll
+        for (int j = 0; j < size<1, 0>(tensor); ++j) {
+            const int col_idx = col_base + nj * 8 + j;
+            const int real_col = col_idx_offset + col_idx;
+            float local_sum = 0;
+            // local row sum
+            // 0
+#pragma unroll          
+            for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
+                // 0 ~ 1
+#pragma unroll
+                for (int i = 0; i < size<0, 0>(tensor); ++i) {
+                    const int row_idx = row_base + mi * warp_row_stride + i * 8;
+                    const int real_row = row_idx_offset + row_idx;
+                    if (real_row < max_row 
+                        && real_col < max_col 
+                        && real_row >= real_col 
+                        && real_row - real_col < num_local_tokens) {
+                        local_sum += tensor(make_coord(i, mi), make_coord(j, nj));
+                    }
+                }
+            }
+            // thread comm group
+            // 4 * 8
+            // <0,  4,   8, ... 28>
+            // <1,  5,   9, ... 29>
+            // <2,  6,  10, ... 30>
+            // <3,  7,  11, ... 31>
+            local_sum += __shfl_down_sync(0xffffffff, local_sum, 4);
+            local_sum += __shfl_down_sync(0xffffffff, local_sum, 8);
+            local_sum += __shfl_down_sync(0xffffffff, local_sum, 16);
+            // save row-wise sum to shm
+            if (lane_id < 4) {
+                warp_buffer[warp_buffer_offset + col_idx] = local_sum;
+            }
+        }
+    }
+    __syncthreads();
+    // buffer reduce and save to global memory
+    for (int idx = thread_id; idx < kCols; idx += num_threads) {
+#pragma unroll
+        for (int row = 1; row < kNWarps; ++row) {
+            warp_buffer[idx] += warp_buffer[row * kCols + idx];
+        }
+        dst[idx] = Element(warp_buffer[idx]);
+    }
+};
+
+template<int kCols, typename Element, typename Engine, typename Layout>
+__forceinline__ __device__ void col_reduce_decode(Element *dst, //ngroups * dst_num_cols
+                                                  const int ngroups, 
+                                                  const int dst_num_cols,
+                                                  Tensor<Engine, Layout> &tensor_,
+                                                  const int col_idx_offset,
+                                                  const int row_idx_offset,
+                                                  const int warp_row_stride,
+                                                  const int num_local_tokens,
+                                                  const int max_cols) {
+    Tensor tensor = make_tensor(tensor_.data(), flash::convert_layout_acc_rowcol(tensor_.layout()));
+    const int thread_id = threadIdx.x;
+    const int lane_id = thread_id % 32;
+    const int row_base = (thread_id / 32) * 16 + (thread_id % 32) / 4;
+    const int col_base = (lane_id % 4) * 2;
+    // 0 ~ 15
+#pragma unroll
+    for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+        // 0 ~ 1
+#pragma unroll
+        for (int j = 0; j < size<1, 0>(tensor); ++j) {
+            const int col_idx = col_base + nj * 8 + j;
+            const int real_col_idx = col_idx_offset + col_idx;
+            // 0
+#pragma unroll          
+            for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
+                // 0 ~ 1
+#pragma unroll
+                for (int i = 0; i < size<0, 0>(tensor); ++i) {
+                    const int row_idx = row_base + mi * warp_row_stride + i * 8;
+                    // const int real_row_idx = row_idx_offset + row_idx; 
+                    if (row_idx < ngroups
+                        && real_col_idx < max_cols
+                        && row_idx_offset - real_col_idx < num_local_tokens) {
+                        dst[row_idx * dst_num_cols + real_col_idx] = Element(tensor(make_coord(i, mi), make_coord(j, nj)));
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

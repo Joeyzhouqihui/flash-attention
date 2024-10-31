@@ -143,6 +143,9 @@ struct Flash_fwd_params : public Qkv_params {
     int attn_scores_rows;
     int attn_scores_cols;
     void * __restrict__ attn_scores_ptr;
+    bool reduce_attn_scores;
+    bool is_prefill;
+    int ngroups;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

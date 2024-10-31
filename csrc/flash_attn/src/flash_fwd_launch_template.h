@@ -97,7 +97,11 @@ template<typename Kernel_traits>
 void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(!Kernel_traits::Is_Q_in_regs, "SplitKV implementation does not support Is_Q_in_regs");
     static_assert(!Kernel_traits::Share_Q_K_smem, "SplitKV implementation does not support Share_Q_K_smem");
-    constexpr size_t smem_size = Kernel_traits::kSmemSize;
+    size_t smem_size = Kernel_traits::kSmemSize;
+    size_t smem_attn_scores_size = sizeof(float) * Kernel_traits::kBlockN * Kernel_traits::kNWarps;
+    if (params.attn_scores_ptr != nullptr && params.reduce_attn_scores && params.is_prefill) {
+        smem_size += smem_attn_scores_size;
+    }
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
     dim3 grid(num_m_block, params.num_splits > 1 ? params.num_splits : params.b, params.num_splits > 1 ? params.b * params.h : params.h);
     // printf("num_split: %d, grid x: %d, y: %d, z: %d\n", params.num_splits, grid.x, grid.y, grid.z);
