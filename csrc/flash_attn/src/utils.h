@@ -305,11 +305,72 @@ __forceinline__ __device__ void col_reduce_decode(Element *dst, //ngroups * dst_
                         && row_idx_offset - real_col_idx < num_local_tokens) {
                         dst[row_idx * dst_num_cols + real_col_idx] = Element(tensor(make_coord(i, mi), make_coord(j, nj)));
                     }
+                    // if (row_idx < ngroups && real_col_idx < max_cols) {
+                    //     dst[row_idx * dst_num_cols + real_col_idx] = Element(tensor(make_coord(i, mi), make_coord(j, nj)));
+                    // }
                 }
             }
         }
     }
     __syncthreads();
+};
+
+template<int kCols, typename Engine, typename Layout>
+__forceinline__ __device__ void save_attn_weight (float *dst, //ngroups * dst_num_pages
+                                                  const int ngroups, 
+                                                  const int dst_num_pages,
+                                                  const int page_size,
+                                                  float *warp_buffer, //ngroups * kCols
+                                                  Tensor<Engine, Layout> &tensor_,
+                                                  const int col_idx_offset,
+                                                  const int warp_row_stride,
+                                                  const int max_cols,
+                                                  const float softmax_scale) {
+    Tensor tensor = make_tensor(tensor_.data(), flash::convert_layout_acc_rowcol(tensor_.layout()));
+    const int thread_id = threadIdx.x;
+    const int lane_id = thread_id % 32;
+    const int row_base = (thread_id / 32) * 16 + (thread_id % 32) / 4;
+    const int col_base = (lane_id % 4) * 2;
+    // 0 ~ 15
+#pragma unroll
+    for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+        // 0 ~ 1
+#pragma unroll
+        for (int j = 0; j < size<1, 0>(tensor); ++j) {
+            const int col_idx = col_base + nj * 8 + j;
+            const int real_col_idx = col_idx_offset + col_idx;
+            // 0
+#pragma unroll          
+            for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
+                // 0 ~ 1
+#pragma unroll
+                for (int i = 0; i < size<0, 0>(tensor); ++i) {
+                    const int row_idx = row_base + mi * warp_row_stride + i * 8;
+                    if (row_idx < ngroups && real_col_idx < max_cols) {
+                        warp_buffer[row_idx * kCols + col_idx] = expf(tensor(make_coord(i, mi), make_coord(j, nj)) * softmax_scale);
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+    const int num_pages_per_group = kCols / page_size;
+    const int num_pages = num_pages_per_group * ngroups;
+    const int num_threads = blockDim.x;
+    const int dst_page_offset = col_idx_offset / page_size;
+    const int max_num_pages = max_cols / page_size;
+    for (int idx = thread_id; idx < num_pages; idx += num_threads) {
+        float attn_weight = 0;
+        const int group_id = idx / num_pages_per_group;
+        const int page_id = idx % num_pages_per_group;
+        const int offset = group_id * kCols + page_id * page_size;
+        for (int i = 0; i < page_size; i++) {
+            attn_weight += warp_buffer[offset + i];
+        }
+        if (dst_page_offset + page_id < max_num_pages) {
+            dst[group_id * dst_num_pages + dst_page_offset + page_id] = attn_weight;
+        }
+    }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -14,6 +14,7 @@
 #endif
 
 #include <ATen/cuda/CUDAGraphsUtils.cuh> // For at::cuda::philox::unpack
+#include <cuda_runtime.h>
 
 constexpr int TOTAL_DIM = 0;
 constexpr int H_DIM = 1;
@@ -144,8 +145,17 @@ struct Flash_fwd_params : public Qkv_params {
     int attn_scores_cols;
     void * __restrict__ attn_scores_ptr;
     bool reduce_attn_scores;
+    int attn_weights_rows;
+    int attn_weights_cols;
+    void * __restrict__ attn_weights_ptr;
+    bool return_attn_weights;
+    void * __restrict__ es_min_ptr;
     bool is_prefill;
     int ngroups;
+
+    int *num_remain_seqs_ptr;
+    int iteration;
+
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -196,3 +206,11 @@ template<typename T, int Headdim> void run_mha_fwd_(Flash_fwd_params &params, cu
 template<typename T, int Headdim> void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream);
 
 template<typename T, int Headdim> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
+
+void dummy(int iteration, cudaStream_t stream);
+
+void process_es(Flash_fwd_params &params,
+                float *es_acc, float *es_min,
+                int *total_seq_lens, int block_chunk_size,
+                volatile int *seq_states, volatile int *compute_iteration,
+                int iteration, float threshold, cudaStream_t stream);

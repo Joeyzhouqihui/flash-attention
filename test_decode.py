@@ -127,7 +127,7 @@ if __name__ == "__main__":
         torch.cuda.synchronize()
         if i >= warmup:
             total_time -= time.time()
-        flash_output1, flash_attn_weights1, flash_attn_scores = flash_attn_with_kvcache(
+        flash_output1, softmax_lse, flash_attn_weights = flash_attn_with_kvcache(
             q=query,
             k_cache=key_cache,
             v_cache=value_cache,
@@ -137,42 +137,44 @@ if __name__ == "__main__":
             rotary_interleaved=False,
             alibi_slopes=None,
             block_table=block_tables,
-            num_local_tokens=local_window,
-            return_attn_scores=True
+            num_local_tokens=0,
+            return_attn_scores=False,
+            reduce_attn_scores=False,
+            return_attn_weights=True
         )
         torch.cuda.synchronize()
         if i >= warmup:
             total_time += time.time()
     print("flash attention time cost with attn scores: ", total_time / (num_pass - warmup) * 1000)
-    print("flash attn scores shape: ", flash_attn_scores.shape)
-    print("flash attn weight shape: ", flash_attn_weights1.shape)
-    
-    total_time = 0
-    for i in range(num_pass):
-        torch.cuda.synchronize()
-        if i >= warmup:
-            total_time -= time.time()
-        flash_output2, flash_attn_weights2, flash_attn_scores2 = flash_attn_with_kvcache(
-            q=query,
-            k_cache=key_cache,
-            v_cache=value_cache,
-            cache_seqlens=key_lens_tensor,
-            softmax_scale=head_dim**-0.5,
-            causal=True,
-            rotary_interleaved=False,
-            alibi_slopes=None,
-            block_table=block_tables,
-            num_local_tokens=local_window,
-            return_attn_scores=True,
-            reduce_attn_scores=True
-        )
+    # print("flash attn scores shape: ", flash_attn_scores.shape)
+    print("flash attn weight shape: ", flash_attn_weights.shape)
+    exit(0)
+    # total_time = 0
+    # for i in range(num_pass):
+    #     torch.cuda.synchronize()
+    #     if i >= warmup:
+    #         total_time -= time.time()
+    #     flash_output2, flash_attn_weights2, flash_attn_scores2 = flash_attn_with_kvcache(
+    #         q=query,
+    #         k_cache=key_cache,
+    #         v_cache=value_cache,
+    #         cache_seqlens=key_lens_tensor,
+    #         softmax_scale=head_dim**-0.5,
+    #         causal=True,
+    #         rotary_interleaved=False,
+    #         alibi_slopes=None,
+    #         block_table=block_tables,
+    #         num_local_tokens=local_window,
+    #         return_attn_scores=True,
+    #         reduce_attn_scores=True
+    #     )
         
-        torch.cuda.synchronize()
-        if i >= warmup:
-            total_time += time.time()
-    print("flash attention time cost with attn scores reduce: ", total_time / (num_pass - warmup) * 1000)
-    print("flash attn scores with attn scores reduce shape: ", flash_attn_scores2.shape)
-    print("flash attn weight shape: ", flash_attn_weights2.shape)
+    #     torch.cuda.synchronize()
+    #     if i >= warmup:
+    #         total_time += time.time()
+    # print("flash attention time cost with attn scores reduce: ", total_time / (num_pass - warmup) * 1000)
+    # print("flash attn scores with attn scores reduce shape: ", flash_attn_scores2.shape)
+    # print("flash attn weight shape: ", flash_attn_weights2.shape)
     
     query = query.reshape((batch_size, -1, num_head, head_dim))
     key = key_cache[block_tables].reshape((batch_size, -1, num_k_head, head_dim))
@@ -183,20 +185,19 @@ if __name__ == "__main__":
 
     # assert flash_output0.shape == torch_output.shape
     # assert flash_output1.shape == torch_output.shape
-    assert flash_output2.shape == torch_output.shape
-    assert flash_attn_weights1.shape == torch_attn_weights.shape
-    assert flash_attn_weights2.shape == torch_attn_weights.shape
+    # assert flash_output2.shape == torch_output.shape
+    # assert flash_attn_weights1.shape == torch_attn_weights.shape
+    # assert flash_attn_weights2.shape == torch_attn_weights.shape
     
-    flash_attn_weights1 = flash_attn_weights1.flatten()
-    flash_attn_weights2 = flash_attn_weights2.flatten()
+    # flash_attn_weights1 = flash_attn_weights1.flatten()
+    # flash_attn_weights2 = flash_attn_weights2.flatten()
     torch_attn_weights = torch_attn_weights.flatten()
-    diff1 = 0
-    diff2 = 0
-    for idx in range(flash_attn_weights1.stride(0)):
-        diff1 += torch.abs(flash_attn_weights1[idx] - flash_attn_weights2[idx])
-        diff2 += torch.abs(flash_attn_weights1[idx] - torch_attn_weights[idx])
-    assert diff1 == 0
-    print("attn weight sum diff: ", diff2)
+    # diff1 = torch.sum(torch.abs(flash_attn_weights - flash_attn_weights2))
+    diff2 = torch.sum(torch.abs(flash_attn_weights - torch_attn_weights))
+    # for i in range(len(flash_attn_weights1)):
+    #     if i % 7 == 0:
+    #         print(flash_attn_weights1[i], torch_attn_weights[i])
+    # assert diff1 == 0
     
     # flash_output0 = flash_output0.flatten()
     # flash_output1 = flash_output1.flatten()

@@ -47,14 +47,22 @@ def attention_pytorch(query, key, value, local_window):
     attention_scores.masked_fill_(causal_mask, float('-inf'))
     return output, attention_scores, softmax_lse
 
-def merge(acc_softmax_lse, acc_o, new_softmax_lse, new_o):
-    assert acc_softmax_lse.shape == new_softmax_lse.shape
-    assert acc_o.shape == new_o.shape
+def merge(acc_attn_weights, acc_o, new_softmax_lse, new_o):
+    bs = acc_o.shape[0]
+    num_head = acc_o.shape[2]
+    acc_attn_weights = acc_attn_weights.reshape(bs, 1, num_head, 1)
+    new_softmax_lse = new_softmax_lse.reshape(bs, 1, num_head, 1)
+    new_attn_weights = torch.exp(new_softmax_lse)
+    updated_acc_attn_weights = acc_attn_weights + new_attn_weights
+    w_acc = acc_attn_weights / updated_acc_attn_weights
+    w_new = new_attn_weights / updated_acc_attn_weights
+    acc_o = w_acc * acc_o + w_new * new_o
+    return updated_acc_attn_weights, acc_o.type(torch.float16)
 
 if __name__ == "__main__":
-    num_blocks = 102400
-    block_size = 16
-    num_k_head = 8
+    num_blocks = 10240
+    block_size = 32
+    num_k_head = 32
     head_dim = 128
     kv_cache = torch.randn(
         (2, num_blocks, block_size, num_k_head, head_dim),                    
@@ -63,11 +71,11 @@ if __name__ == "__main__":
     )
     key_cache = kv_cache[0]
     value_cache = kv_cache[1]
-    batch_size = 32
-    num_head = 16
+    batch_size = 4
+    num_head = 32
     query_len = 1
-    local_window = 512
-    key_len = 128
+    local_window = 4096
+    key_len = 512
     query = torch.randn(
         (batch_size, query_len, num_head, head_dim),                    
         dtype=torch.float16, 
@@ -75,7 +83,10 @@ if __name__ == "__main__":
     )
     
     key_lens_tensor = torch.ones((batch_size, ), dtype=torch.int32, device='cuda:0') * key_len
-    
+    key_lens_tensor[0] = 512
+    key_lens_tensor[1] = 512
+    key_lens_tensor[2] = 512
+    key_lens_tensor[3] = 512
     block_ids = range(0, num_blocks - 1)
     block_tables = random.sample(block_ids, key_len // block_size * batch_size)
     block_tables = torch.tensor(block_tables,
@@ -91,7 +102,7 @@ if __name__ == "__main__":
         torch.cuda.synchronize()
         if i >= warmup:
             total_time -= time.time()
-        flash_output0, flash_attn_weights = flash_attn_with_kvcache(
+        flash_output0, flash_attn_weights_sum, flash_attn_weights_min = flash_attn_with_kvcache(
             q=query,
             k_cache=key_cache,
             v_cache=value_cache,
@@ -101,46 +112,60 @@ if __name__ == "__main__":
             causal=True,
             alibi_slopes=None,
             block_table=block_tables,
+            return_attn_weights=True
         )
         torch.cuda.synchronize()
         if i >= warmup:
             total_time += time.time()
     print("flash attention time cost without attn scores: ", total_time / (num_pass - warmup) * 1000)
+    
+    exit(0)
+    
     org_latency = total_time / (num_pass - warmup)
-    
-    total_time = 0
-    for i in range(num_pass):
-        torch.cuda.synchronize()
-        if i >= warmup:
-            total_time -= time.time()
-        flash_output, flash_attn_weights, flash_attn_scores = flash_attn_with_kvcache(
-            q=query,
-            k_cache=key_cache,
-            v_cache=value_cache,
-            cache_seqlens=key_lens_tensor,
-            softmax_scale=head_dim**-0.5,
-            causal=True,
-            rotary_interleaved=False,
-            alibi_slopes=None,
-            block_table=block_tables,
-            num_local_tokens=local_window,
-            return_attn_scores=True,
-            reduce_attn_scores=True
-        )
-        torch.cuda.synchronize()
-        if i >= warmup:
-            total_time += time.time()
-    print("flash attention time cost with attn scores reduce: ", total_time / (num_pass - warmup) * 1000)
-    
-    print(flash_output.shape)
+    flash_attn_weights = flash_attn_weights.reshape(batch_size, num_head, key_len // block_size)
+    softmax_lse = softmax_lse.reshape(batch_size, num_head)
     print(flash_attn_weights.shape)
+    print(softmax_lse.shape)
+    flash_attn_weights_min = flash_attn_weights_min.reshape(batch_size, num_head)
+    for i in range(batch_size):
+        key_len = key_lens_tensor[i]
+        num_pages = key_len // block_size
+        for head_idx in range(num_head):
+            print("sum: ", torch.exp(softmax_lse[i][head_idx]), torch.sum(flash_attn_weights[i][head_idx][:num_pages]))
+            print("min: ", flash_attn_weights_min[i][head_idx], torch.min(flash_attn_weights[i][head_idx][:num_pages], -1)[0])
     
-    flash_output0 = flash_output0.flatten()
-    flash_output = flash_output.flatten()
-    diff = 0
-    for idx in range(flash_output0.stride(0)):
-        diff += torch.abs(flash_output0[idx] - flash_output[idx])
+    exit(0)
+    
+    flash_attn_weights = torch.sum(flash_attn_weights, dim=2).flatten()
+    flash_attn_weights = flash_attn_weights.reshape(softmax_lse.shape[0], num_k_head, -1)
+    print(flash_attn_weights.shape)
+    for i in range(8):
+        per_head_attn_weights = flash_attn_weights[0][i]
+        per_head_attn_weights = per_head_attn_weights.flatten().tolist()
+        per_head_attn_weights.sort(reverse=True)
+        print(per_head_attn_weights)
+    # softmax_scale = head_dim**-0.5
+    # flash_attn_scores = flash_attn_scores.type(torch.float32)
+    # flash_attn_scores = torch.sum(torch.exp(flash_attn_scores * softmax_scale), dim=-1).flatten()
+    flash_attn_weights = torch.sum(flash_attn_weights, dim=-1).flatten()
+    softmax_lse = torch.exp(softmax_lse).flatten()
+    diff = torch.sum(torch.abs(softmax_lse - flash_attn_weights))
     print("output diff: ", diff)
+    # diff = torch.sum(torch.abs(softmax_lse - flash_attn_scores))
+    # # print(softmax_lse.shape, flash_attn_scores.shape, flash_attn_weights.shape)
+    # for i in range(len(softmax_lse)):
+    #     if i % 17 == 0:
+    #         print(softmax_lse[i], flash_attn_weights[i])
+    # print("output diff: ", diff)
     
-
+    # softmax_scale = head_dim**-0.5
+    # flash_attn_scores = torch.log(torch.sum(torch.exp(flash_attn_scores.type(torch.float32) * softmax_scale), dim=-1))
+    # flash_attn_scores = flash_attn_scores.transpose(1, 2).reshape(batch_size, num_head)
+    # flash_attn_scores = flash_attn_scores.flatten()
+    # flash_attn_weights = flash_attn_weights.reshape(batch_size, num_head)
+    # flash_attn_weights = flash_attn_weights.flatten()
+    # diff = 0
+    # for idx in range(flash_attn_scores.stride(0)):
+    #     diff += torch.abs(flash_attn_scores[idx] - flash_attn_weights[idx])
+    # print("output diff: ", diff)
     

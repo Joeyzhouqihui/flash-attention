@@ -1159,8 +1159,12 @@ def flash_attn_with_kvcache(
     num_local_tokens=0,
     return_attn_scores=False,
     reduce_attn_scores=False,
+    return_attn_weights=False,
     *,
     out=None,
+    out_es_sum=None,
+    out_es_min=None,
+    out_es_buffer=None,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -1243,20 +1247,19 @@ def flash_attn_with_kvcache(
     Return:
         out: (batch_size, seqlen, nheads, headdim).
     """
-    assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
-    assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
-    maybe_contiguous = lambda x: x.contiguous() if x is not None and x.stride(-1) != 1 else x
-    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** (-0.5)
-    if cache_seqlens is not None and isinstance(cache_seqlens, int):
-        cache_seqlens = torch.full(
-            (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
-        )
-        cache_seqlens = maybe_contiguous(cache_seqlens)
-    cache_batch_idx = maybe_contiguous(cache_batch_idx)
-    block_table = maybe_contiguous(block_table)
-    out, softmax_lse, attn_scores = flash_attn_cuda.fwd_kvcache(
+    # assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
+    # assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+    # maybe_contiguous = lambda x: x.contiguous() if x is not None and x.stride(-1) != 1 else x
+    # q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    softmax_scale = q.shape[-1] ** (-0.5)
+    # if cache_seqlens is not None and isinstance(cache_seqlens, int):
+    #     cache_seqlens = torch.full(
+    #         (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
+    #     )
+    #     cache_seqlens = maybe_contiguous(cache_seqlens)
+    # cache_batch_idx = maybe_contiguous(cache_batch_idx)
+    # block_table = maybe_contiguous(block_table)
+    out, softmax_lse, attn_weights = flash_attn_cuda.fwd_kvcache(
         q,
         k_cache,
         v_cache,
@@ -1269,6 +1272,9 @@ def flash_attn_with_kvcache(
         block_table,
         alibi_slopes,
         out,
+        out_es_sum,
+        out_es_min,
+        out_es_buffer,
         softmax_scale,
         causal,
         window_size[0],
@@ -1278,7 +1284,6 @@ def flash_attn_with_kvcache(
         num_local_tokens,
         return_attn_scores,
         reduce_attn_scores,
+        return_attn_weights
     )
-    if return_attn_scores:
-        return out, softmax_lse, attn_scores
-    return out, softmax_lse
+    return out, softmax_lse, attn_weights

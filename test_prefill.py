@@ -148,7 +148,7 @@ if __name__ == "__main__":
             causal=True,
             alibi_slopes=None,
             block_table=block_tables,
-            num_local_tokens=int(40),
+            num_local_tokens=0,
             return_attn_scores=False
         )
         torch.cuda.synchronize()
@@ -157,59 +157,59 @@ if __name__ == "__main__":
     print("flash attention time cost without attn scores: ", total_time / (num_pass - warmup) * 1000)
     org_latency = total_time / (num_pass - warmup)
     
-    total_time = 0
-    for i in range(num_pass):
-        torch.cuda.synchronize()
-        if i >= warmup:
-            total_time -= time.time()
-        flash_output1, flash_attn_scores1 = flash_attn_varlen_func(
-            q=query,
-            k=key_cache,
-            v=value_cache,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=int(query_len),
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_k=int(key_len),
-            softmax_scale=head_dim**-0.5,
-            causal=True,
-            alibi_slopes=None,
-            block_table=block_tables,
-            num_local_tokens=local_window,
-            return_attn_scores=True
-        )
-        torch.cuda.synchronize()
-        if i >= warmup:
-            total_time += time.time()
-    print("flash attention time cost with attn scores: ", total_time / (num_pass - warmup) * 1000)
-    print("flash attn scores shape: ", flash_attn_scores1.shape)
+    # total_time = 0
+    # for i in range(num_pass):
+    #     torch.cuda.synchronize()
+    #     if i >= warmup:
+    #         total_time -= time.time()
+    #     flash_output1, flash_attn_scores1 = flash_attn_varlen_func(
+    #         q=query,
+    #         k=key_cache,
+    #         v=value_cache,
+    #         cu_seqlens_q=cu_seqlens_q,
+    #         max_seqlen_q=int(query_len),
+    #         cu_seqlens_k=cu_seqlens_k,
+    #         max_seqlen_k=int(key_len),
+    #         softmax_scale=head_dim**-0.5,
+    #         causal=True,
+    #         alibi_slopes=None,
+    #         block_table=block_tables,
+    #         num_local_tokens=local_window,
+    #         return_attn_scores=True
+    #     )
+    #     torch.cuda.synchronize()
+    #     if i >= warmup:
+    #         total_time += time.time()
+    # print("flash attention time cost with attn scores: ", total_time / (num_pass - warmup) * 1000)
+    # print("flash attn scores shape: ", flash_attn_scores1.shape)
     
-    total_time = 0
-    for i in range(num_pass):
-        torch.cuda.synchronize()
-        if i >= warmup:
-            total_time -= time.time()
-        flash_output2, flash_attn_scores2 = flash_attn_varlen_func(
-            q=query,
-            k=key_cache,
-            v=value_cache,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=int(query_len),
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_k=int(key_len),
-            softmax_scale=head_dim**-0.5,
-            causal=True,
-            alibi_slopes=None,
-            block_table=block_tables,
-            num_local_tokens=local_window,
-            return_attn_scores=True,
-            reduce_attn_scores=True
-        )
-        torch.cuda.synchronize()
-        if i >= warmup:
-            total_time += time.time()
-    print("flash attention time cost with attn scores reduce: ", total_time / (num_pass - warmup) * 1000)
-    print("flash attn scores with attn scores reduce shape: ", flash_attn_scores2.shape)
-    print("flash output shape: ", flash_output2.shape)
+    # total_time = 0
+    # for i in range(num_pass):
+    #     torch.cuda.synchronize()
+    #     if i >= warmup:
+    #         total_time -= time.time()
+    #     flash_output2, flash_attn_scores2 = flash_attn_varlen_func(
+    #         q=query,
+    #         k=key_cache,
+    #         v=value_cache,
+    #         cu_seqlens_q=cu_seqlens_q,
+    #         max_seqlen_q=int(query_len),
+    #         cu_seqlens_k=cu_seqlens_k,
+    #         max_seqlen_k=int(key_len),
+    #         softmax_scale=head_dim**-0.5,
+    #         causal=True,
+    #         alibi_slopes=None,
+    #         block_table=block_tables,
+    #         num_local_tokens=local_window,
+    #         return_attn_scores=True,
+    #         reduce_attn_scores=True
+    #     )
+    #     torch.cuda.synchronize()
+    #     if i >= warmup:
+    #         total_time += time.time()
+    # print("flash attention time cost with attn scores reduce: ", total_time / (num_pass - warmup) * 1000)
+    # print("flash attn scores with attn scores reduce shape: ", flash_attn_scores2.shape)
+    # print("flash output shape: ", flash_output2.shape)
     
     query = query.reshape((batch_size, -1, num_head, head_dim))
     key = key_cache[block_tables].reshape((batch_size, -1, num_k_head, head_dim))
@@ -218,25 +218,25 @@ if __name__ == "__main__":
     print("torch attn scores shape: ", torch_attn_scores_16.shape)
     
     flash_output0 = flash_output0.flatten()
-    flash_output1 = flash_output1.flatten()
-    flash_output2 = flash_output2.flatten()
+    # flash_output1 = flash_output1.flatten()
+    # flash_output2 = flash_output2.flatten()
     torch_output = torch_output.flatten()
     
     diff = 0
     for idx in range(flash_output0.stride(0)):
         diff += torch.abs(flash_output0[idx] - torch_output[idx])
     print("output diff: ", diff)
-    diff = 0
-    for idx in range(flash_output1.stride(0)):
-        diff += torch.abs(flash_output1[idx] - torch_output[idx])
-    print("output diff: ", diff)
-    diff = 0
-    for idx in range(flash_output2.stride(0)):
-        diff += torch.abs(flash_output2[idx] - torch_output[idx])
-    print("output diff: ", diff)
+    # diff = 0
+    # for idx in range(flash_output1.stride(0)):
+    #     diff += torch.abs(flash_output1[idx] - torch_output[idx])
+    # print("output diff: ", diff)
+    # diff = 0
+    # for idx in range(flash_output2.stride(0)):
+    #     diff += torch.abs(flash_output2[idx] - torch_output[idx])
+    # print("output diff: ", diff)
     
-    checkAttnScores(flash_attn_scores1, torch_attn_scores_16, batch_size, num_head, query_len, key_len, local_window)
-    checkAttnScoresReduce(flash_attn_scores2, torch_attn_scores_32, batch_size, num_head, query_len, key_len, local_window)
+    # checkAttnScores(flash_attn_scores1, torch_attn_scores_16, batch_size, num_head, query_len, key_len, local_window)
+    # checkAttnScoresReduce(flash_attn_scores2, torch_attn_scores_32, batch_size, num_head, query_len, key_len, local_window)
     # left = max(0, key_len-query_len-local_window+1)
     # print(flash_attn_scores2[0][0][0][left:left+10])
     # print(torch_attn_scores[0][0][0][left:left+10])

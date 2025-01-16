@@ -485,7 +485,6 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
 template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
-
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
@@ -509,7 +508,11 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     }
     // shape <kNWarps, kBlockM>
     float *attn_scores_warp_buffer = reinterpret_cast<float*>(smem_org_);
-
+    bool Return_attn_weights = (params.attn_weights_ptr != nullptr);
+    if (Return_attn_weights && !params.is_prefill) {
+        smem_ += sizeof(float) * kBlockN * params.ngroups;
+    }
+    float *attn_weights_buffer = reinterpret_cast<float*>(smem_org_);
 
     using GmemTiledCopyO = std::conditional_t<
         !Split,
@@ -604,7 +607,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // assert(m_block == 0);
     const index_t row_offset_as_reduce = ((bidb * params.h + bidh) * params.attn_scores_rows
         + m_block) * params.attn_scores_cols;
-
+    // const index_t row_offset_as_attn_weight = ((bidb * params.h + bidh) * params.ngroups
+    //     + m_block) * params.attn_scores_cols / params.page_block_size;
+    const index_t row_offset_as_attn_weight = ((bidb * params.h + bidh) * params.ngroups
+        + m_block) * params.attn_weights_cols;
     // if (threadIdx.x == 0) {
     //     printf("block: %d %d %d, bidb: %d, bidh: %d, n_block_max: %d, offset: %ld\n", 
     //      blockIdx.x, blockIdx.y, blockIdx.z, 
@@ -632,7 +638,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                              Shape<Int<kBlockM>, Int<kBlockN>>{},
                              make_stride(params.attn_scores_cols, _1{}));
     Element *gAS_reduce_ptr = reinterpret_cast<Element *>(params.attn_scores_ptr) + row_offset_as_reduce;
-    
+    float *gAS_attn_weight_ptr = reinterpret_cast<float *>(params.attn_weights_ptr) + row_offset_as_attn_weight;
+
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                             typename Kernel_traits::SmemLayoutQ{});
     Tensor sK = make_tensor(sQ.data() + size(sQ), typename Kernel_traits::SmemLayoutKV{});
@@ -672,6 +679,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor tOrVt  = thr_mma.partition_fragment_B(sVtNoSwizzle);                // (MMA, MMA_K,MMA_N)
 
     const int attn_scores_cols = params.attn_scores_cols;
+    // const int attn_weights_num_pages = attn_scores_cols / params.page_block_size;
+    const int attn_weights_num_pages = params.attn_weights_cols;
     const int num_local_tokens = params.num_local_tokens;
     Tensor tSgAS = thr_mma.partition_C(gAS);
 
@@ -1016,6 +1025,22 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             }
         }
 
+        if (Return_attn_weights && !params.is_prefill) {
+            const int min_real_col = n_block * kBlockN;
+            flash::save_attn_weight<kBlockN>(
+                gAS_attn_weight_ptr,
+                params.ngroups,
+                attn_weights_num_pages,
+                params.page_block_size,
+                attn_weights_buffer,
+                acc_s,
+                min_real_col,
+                kNWarps * 16,
+                binfo.actual_seqlen_k,
+                params.scale_softmax
+            );
+        }
+
         // We have key_padding_mask so we'll need to Check_inf
         masking_step == 0
             ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2)
@@ -1124,6 +1149,22 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 }
             }
         }
+
+        if (Return_attn_weights && !params.is_prefill) {
+            const int min_real_col = n_block * kBlockN;
+            flash::save_attn_weight<kBlockN>(
+                gAS_attn_weight_ptr,
+                params.ngroups,
+                attn_weights_num_pages,
+                params.page_block_size,
+                attn_weights_buffer,
+                acc_s,
+                min_real_col,
+                kNWarps * 16,
+                binfo.actual_seqlen_k,
+                params.scale_softmax
+            );
+        }
         
         softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
 
@@ -1210,6 +1251,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
     );
 }
+
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

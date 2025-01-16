@@ -91,6 +91,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             });
         });
     });
+
 }
 
 template<typename Kernel_traits>
@@ -101,6 +102,10 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     size_t smem_attn_scores_size = sizeof(float) * Kernel_traits::kBlockN * Kernel_traits::kNWarps;
     if (params.attn_scores_ptr != nullptr && params.reduce_attn_scores && params.is_prefill) {
         smem_size += smem_attn_scores_size;
+    }
+    size_t smem_attn_weights_size = sizeof(float) * Kernel_traits::kBlockN * params.ngroups;
+    if (params.attn_weights_ptr != nullptr && params.return_attn_weights && !params.is_prefill) {
+        smem_size += smem_attn_weights_size;
     }
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
     dim3 grid(num_m_block, params.num_splits > 1 ? params.num_splits : params.b, params.num_splits > 1 ? params.b * params.h : params.h);
