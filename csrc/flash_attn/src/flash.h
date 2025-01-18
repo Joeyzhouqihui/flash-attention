@@ -53,6 +53,7 @@ struct Flash_fwd_params : public Qkv_params {
 
     // The O matrix (output).
     void * __restrict__ o_ptr;
+    void *o_ptr_list[256];
     void * __restrict__ oaccum_ptr;
 
     // The stride between rows of O.
@@ -65,6 +66,7 @@ struct Flash_fwd_params : public Qkv_params {
 
     // The pointer to the softmax sum.
     void * __restrict__ softmax_lse_ptr;
+    void *softmax_lse_ptr_list[256];
     void * __restrict__ softmax_lseaccum_ptr;
 
     // The dimensions.
@@ -77,6 +79,7 @@ struct Flash_fwd_params : public Qkv_params {
     // array of length b+1 holding starting offset of each sequence.
     int * __restrict__ cu_seqlens_q;
     int * __restrict__ cu_seqlens_k;
+    int *cu_seqlens_k_list[256];
 
     // If provided, the actual length of each k sequence.
     int * __restrict__ seqused_k;
@@ -104,6 +107,7 @@ struct Flash_fwd_params : public Qkv_params {
 
     // Paged KV cache
     int * __restrict__ block_table;
+    int *block_table_list[256];
     index_t block_table_batch_stride;
     int page_block_size;
 
@@ -154,8 +158,15 @@ struct Flash_fwd_params : public Qkv_params {
     int ngroups;
 
     int *num_remain_seqs_ptr;
+    float *es_acc;
+    float *es_min;
+    float threshold;
+    int *total_seq_lens;
+    int block_chunk_size;
+    volatile int *seq_states;
+    int *barrier1;
+    int *barrier2;
     int iteration;
-
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

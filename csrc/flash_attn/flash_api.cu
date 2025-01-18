@@ -45,7 +45,16 @@ void set_params_fprop(Flash_fwd_params &params,
                       int attn_weights_rows=0,
                       int attn_weights_cols=0,
                       void *attn_weights_d=nullptr,
-                      bool return_attn_weights=false) {
+                      bool return_attn_weights=false,
+                      int *num_remain_seqs_ptr=nullptr,
+                      int *barrier_ptr1=nullptr,
+                      int *barrier_ptr2=nullptr,
+                      float *es_acc=nullptr,
+                      float *es_min=nullptr,
+                      float threshold=0,
+                      int *total_seq_lens=nullptr,
+                      int block_chunk_size=0,
+                      volatile int *seq_states=nullptr) {
 
     // Reset the parameters
     params = {};
@@ -98,6 +107,15 @@ void set_params_fprop(Flash_fwd_params &params,
     params.ngroups = ngroups;
     // Softmax sum
     params.softmax_lse_ptr = softmax_lse_d;
+    params.num_remain_seqs_ptr = num_remain_seqs_ptr;
+    params.barrier1 = barrier_ptr1;
+    params.barrier2 = barrier_ptr2;
+    params.es_acc = es_acc;
+    params.es_min = es_min;
+    params.threshold = threshold;
+    params.total_seq_lens = total_seq_lens;
+    params.block_chunk_size = block_chunk_size;
+    params.seq_states = seq_states;
 
     // Set the dimensions.
     params.b = b;
@@ -153,12 +171,13 @@ void set_params_fprop(Flash_fwd_params &params,
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
-            if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
-                run_mha_fwd_<elem_type, kHeadDim>(params, stream);
-            } else {
-                // printf("split\n");
-                run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim>(params, stream);
-            }
+            // if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
+            //     run_mha_fwd_<elem_type, kHeadDim>(params, stream);
+            // } else {
+            //     // printf("split\n");
+            //     run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim>(params, stream);
+            // }
+            run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim>(params, stream);
         });
     });
 }
@@ -218,17 +237,18 @@ void set_params_splitkv(Flash_fwd_params &params, const int batch_size,
     const int num_m_blocks = (max_seqlen_q + 64 - 1) / 64;
     params.num_splits = num_splits;
     if (p_dropout == 0.0f) {  // SplitKV is not implemented for dropout
-        if (num_splits < 1) {
-            // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
-            params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, dprops->multiProcessorCount * 2, num_n_blocks, 128);
-        }
-        if (params.num_splits > 1) {
-            at::Tensor softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
-            at::Tensor out_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q, head_size_rounded}, opts.dtype(at::kFloat));
-            params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
-            params.oaccum_ptr = out_accum.data_ptr();
-        }
-        TORCH_CHECK(params.num_splits <= 128, "num_splits > 128 not supported");
+        // if (num_splits < 1) {
+        //     // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
+        //     params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, dprops->multiProcessorCount * 2, num_n_blocks, 128);
+        // }
+        // if (params.num_splits > 1) {
+        //     at::Tensor softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
+        //     at::Tensor out_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q, head_size_rounded}, opts.dtype(at::kFloat));
+        //     params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
+        //     params.oaccum_ptr = out_accum.data_ptr();
+        // }
+        // TORCH_CHECK(params.num_splits <= 128, "num_splits > 128 not supported");
+        params.num_splits = 1;
     }
 }
 
@@ -623,6 +643,9 @@ mha_fwd_kvcache_multiple(at::Tensor &old_q,                  // batch_size x seq
     }
 
     Flash_fwd_params params;
+    at::Tensor num_remain_seqs_tensor = torch::zeros({1}, opts.dtype(torch::kInt32));
+    at::Tensor barrier_tensor1 = torch::zeros({1}, opts.dtype(torch::kInt32));
+    at::Tensor barrier_tensor2 = torch::zeros({1}, opts.dtype(torch::kInt32));
     set_params_fprop(params,
                      batch_size,
                      seqlen_q, seqlen_k,
@@ -651,7 +674,16 @@ mha_fwd_kvcache_multiple(at::Tensor &old_q,                  // batch_size x seq
                      return_attn_weights ? attn_weights.sizes()[2] : 0,
                      return_attn_weights ? attn_weights.sizes()[3] : 0,
                      return_attn_weights ? attn_weights.data_ptr() : nullptr,
-                     return_attn_weights);
+                     return_attn_weights,
+                     reinterpret_cast<int*>(num_remain_seqs_tensor.data_ptr()),
+                     reinterpret_cast<int*>(barrier_tensor1.data_ptr()),
+                     reinterpret_cast<int*>(barrier_tensor2.data_ptr()),
+                     es_acc,
+                     es_min,
+                     threshold,
+                     total_seq_lens,
+                     block_chunk_size,
+                     seq_states);
                      
 
     at::Tensor k, v, k_padded, v_padded;
@@ -749,16 +781,21 @@ mha_fwd_kvcache_multiple(at::Tensor &old_q,                  // batch_size x seq
             out = out.reshape({batch_size, num_heads, seqlen_q, head_size_og}).transpose(1, 2);
         }
         params.o_ptr = out.data_ptr();
+        params.o_ptr_list[iteration] = out.data_ptr();
         // update softmax lse des
         at::Tensor softmax_lse = out_es_sum_list_[iteration];
         softmax_lse = softmax_lse.reshape({batch_size, num_heads, seqlen_q});
         params.softmax_lse_ptr = softmax_lse.data_ptr();
+        params.softmax_lse_ptr_list[iteration] = softmax_lse.data_ptr();
         // update seq lens info
         at::Tensor seqlens_k = seqlens_k_list_[iteration];
         params.cu_seqlens_k = static_cast<int*>(seqlens_k.data_ptr());
+        params.cu_seqlens_k_list[iteration] = static_cast<int*>(seqlens_k.data_ptr());
         // update block table info
         at::Tensor block_table = block_table_list_[iteration];
         params.block_table = static_cast<int*>(block_table.data_ptr());
+        params.block_table_list[iteration] = static_cast<int*>(block_table.data_ptr());
+        params.iteration = iteration;
         run_mha_fwd(params, stream, /*force_split_kernel=*/k_.has_value() || cache_batch_idx_.has_value() || paged_KV);
         process_es(
             params,

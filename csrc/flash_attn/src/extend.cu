@@ -83,24 +83,24 @@ void process_es(Flash_fwd_params &params,
                 int *total_seq_lens, int block_chunk_size,
                 volatile int *seq_states, volatile int *compute_iteration,
                 int iteration, float threshold, cudaStream_t stream) {
-    const int batch_size = params.b;
-    const int num_heads = params.h * params.seqlen_q;
-    const int max_num_blocks = params.attn_weights_cols;
-    const int block_size = params.page_block_size;
-    dim3 grid(batch_size);
-    dim3 block(512);
-    const int warp_size = 32;
-    const int num_warps = 512 / warp_size;
-    const int smem_size = num_heads * 4;
-    process_es_flash_kernel<<<grid, block, smem_size, stream>>>(
-        reinterpret_cast<float*>(params.softmax_lse_ptr),
-        reinterpret_cast<float*>(params.attn_weights_ptr),
-        reinterpret_cast<int*>(params.cu_seqlens_k),
-        batch_size, num_heads, max_num_blocks, block_size,
-        es_acc, es_min, total_seq_lens, block_chunk_size,
-        seq_states,
-        iteration, threshold
-    );
+    // const int batch_size = params.b;
+    // const int num_heads = params.h * params.seqlen_q;
+    // const int max_num_blocks = params.attn_weights_cols;
+    // const int block_size = params.page_block_size;
+    // dim3 grid(batch_size);
+    // dim3 block(512);
+    // const int warp_size = 32;
+    // const int num_warps = 512 / warp_size;
+    // const int smem_size = num_heads * 4;
+    // process_es_flash_kernel<<<grid, block, smem_size, stream>>>(
+    //     reinterpret_cast<float*>(params.softmax_lse_ptr),
+    //     reinterpret_cast<float*>(params.attn_weights_ptr),
+    //     reinterpret_cast<int*>(params.cu_seqlens_k),
+    //     batch_size, num_heads, max_num_blocks, block_size,
+    //     es_acc, es_min, total_seq_lens, block_chunk_size,
+    //     seq_states,
+    //     iteration, threshold
+    // );
     proceed_kernel<<<1, 1, 0, stream>>>(compute_iteration, iteration);
 }
 

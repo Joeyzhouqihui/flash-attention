@@ -483,6 +483,89 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template<typename Params>
+inline __device__ void process_es_kernel(const Params &params, int iteration) {
+    const int thread_block_idx = blockIdx.x * gridDim.y * gridDim.z + blockIdx.y * gridDim.z + blockIdx.z;
+    if (thread_block_idx > params.b) {
+        return;
+    }
+    const int batch_size = params.b;
+    const int num_heads = params.h * params.seqlen_q;
+    const int max_num_blocks = params.attn_weights_cols;
+    const int block_size = params.page_block_size;
+    float *softmax_lse = reinterpret_cast<float*>(params.softmax_lse_ptr_list[iteration]);
+    float *es = reinterpret_cast<float*>(params.attn_weights_ptr);
+    int *num_remain_seqs_ptr = params.num_remain_seqs_ptr;
+    float *es_acc = params.es_acc;
+    float *es_min = params.es_min;
+    int *total_seq_lens = params.total_seq_lens;
+    const int block_chunk_size = params.block_chunk_size;
+    volatile int *seq_states = params.seq_states;
+    const int seq_idx = thread_block_idx;
+    const int thread_idx = threadIdx.x;
+    const int lane_idx = thread_idx % 32;
+    const int warp_idx = thread_idx / 32;
+    const int num_warps = blockDim.x / 32;
+    const int num_blocks = params.cu_seqlens_k_list[iteration][seq_idx] / block_size;
+    if (num_blocks <= 0) {
+        return;
+    }
+    const int num_blocks_roundup = (num_blocks + 32 - 1) / 32 * 32;
+    const int num_blocks_total = (params.total_seq_lens[seq_idx] + block_size - 1) / block_size;
+    const int num_blocks_left = num_blocks_total - (iteration + 1) * block_chunk_size;
+    if (num_blocks_left <= 0) {
+      if (thread_idx == 0) {
+        params.seq_states[seq_idx] = 0;
+      }
+      return;
+    }
+    extern __shared__ char shared_mem[];
+    float *sm_ptg = reinterpret_cast<float*>(shared_mem);
+    for (int head_idx = warp_idx; head_idx < num_heads; head_idx += num_warps) {
+      const int input_es_offset = (seq_idx * num_heads + head_idx) * max_num_blocks;
+      float min_es = 999999;
+      for (int idx = lane_idx; idx < num_blocks_roundup; idx += 32) {
+        float cur_min_es = (idx < num_blocks) ? es[input_es_offset + idx] : 999999;
+#pragma unroll
+        for (int offset = 32 / 2; offset > 0; offset /= 2) {
+          cur_min_es = fminf(cur_min_es, __shfl_down_sync(0xffffffff, cur_min_es, offset));
+        }
+        min_es = fminf(cur_min_es, min_es);
+      }
+      const int es_offset = seq_idx * num_heads + head_idx;
+      if (lane_idx == 0) {
+        float total_es;
+        if (iteration == 0) {
+          total_es = expf(softmax_lse[es_offset]);
+        } else {
+          total_es = es_acc[es_offset] + expf(softmax_lse[es_offset]);
+          min_es = fminf(es_min[es_offset], min_es);
+        }
+        es_acc[es_offset] = total_es;
+        es_min[es_offset] = min_es;
+        softmax_lse[es_offset] = expf(softmax_lse[es_offset]);
+        float head_ptg = total_es / (total_es + min_es * num_blocks_left);
+        sm_ptg[head_idx] = head_ptg;
+      }
+    }
+    __syncthreads();
+    if (thread_idx == 0) {
+      float total_ptg = 0;
+      for (int idx = 0; idx < num_heads; idx++) {
+        total_ptg += sm_ptg[idx];
+      }
+      if (total_ptg / num_heads >= params.threshold) {
+        seq_states[seq_idx] = 0;
+      }
+      // printf("iteration: %d, ptg: %f, threshold: %f\n", iteration, (total_ptg / num_heads), threshold);
+    }
+}
+
+template<typename Params>
+inline __device__ void dummy_kernel(const Params &params) {
+    return;
+}
+
 template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
     using Element = typename Kernel_traits::Element;
@@ -1285,7 +1368,27 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
     const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
     const int n_split_idx = Split ? blockIdx.y : 0;
     const int num_n_splits = Split ? gridDim.y : 1;
+    const int thread_idx = threadIdx.x;
+    const int thread_block_idx = blockIdx.x * gridDim.y * gridDim.z + blockIdx.y * gridDim.z + blockIdx.z;
+    const int num_thread_blocks = gridDim.x * gridDim.y * gridDim.z;
+    volatile int *barrier1 = params.barrier1;
+    volatile int *barrier2 = params.barrier2;
+    if (thread_idx == 0) {
+        while ((*barrier1) < params.iteration * params.b); // sync
+    }
+    __syncthreads();
     flash::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
+    if (thread_idx == 0) {
+        atomicAdd((int *)barrier2, 1);
+        while ((*barrier2) < (params.iteration + 1) * num_thread_blocks); // sync
+    }
+    __syncthreads();
+    if (thread_block_idx < params.b) {
+        flash::process_es_kernel(params, params.iteration);
+        if (thread_idx == 0) {
+            atomicAdd((int *)barrier1, 1);
+        }
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
