@@ -785,15 +785,12 @@ mha_fwd_kvcache_multiple(at::Tensor &old_q,                  // batch_size x seq
         // update softmax lse des
         at::Tensor softmax_lse = out_es_sum_list_[iteration];
         softmax_lse = softmax_lse.reshape({batch_size, num_heads, seqlen_q});
-        params.softmax_lse_ptr = softmax_lse.data_ptr();
         params.softmax_lse_ptr_list[iteration] = softmax_lse.data_ptr();
         // update seq lens info
         at::Tensor seqlens_k = seqlens_k_list_[iteration];
-        params.cu_seqlens_k = static_cast<int*>(seqlens_k.data_ptr());
         params.cu_seqlens_k_list[iteration] = static_cast<int*>(seqlens_k.data_ptr());
         // update block table info
         at::Tensor block_table = block_table_list_[iteration];
-        params.block_table = static_cast<int*>(block_table.data_ptr());
         params.block_table_list[iteration] = static_cast<int*>(block_table.data_ptr());
         params.iteration = iteration;
         run_mha_fwd(params, stream, /*force_split_kernel=*/k_.has_value() || cache_batch_idx_.has_value() || paged_KV);

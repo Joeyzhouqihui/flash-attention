@@ -22,6 +22,13 @@ struct BlockInfo {
         , actual_seqlen_k(params.seqused_k ? params.seqused_k[bidb] : seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : params.seqlen_knew))
         {
         }
+    
+    template<typename Params>
+    __forceinline__ __device__ void update_iteration_info(const Params &params, const int bidb, const int iteration) {
+        sum_s_k = (!Varlen || params.cu_seqlens_k == nullptr || !params.is_seqlens_k_cumulative ? -1 : params.cu_seqlens_k_list[iteration][bidb]);
+        seqlen_k_cache = (!Varlen || params.cu_seqlens_k == nullptr ? params.seqlen_k : (params.is_seqlens_k_cumulative ? params.cu_seqlens_k_list[iteration][bidb + 1] - sum_s_k : params.cu_seqlens_k_list[iteration][bidb]));
+        actual_seqlen_k = (params.seqused_k ? params.seqused_k[bidb] : seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : params.seqlen_knew));
+    }
 
     template <typename index_t>
     __forceinline__ __device__ index_t q_offset(const index_t batch_stride, const index_t row_stride, const int bidb) const {
@@ -33,12 +40,12 @@ struct BlockInfo {
         return sum_s_k == -1 ? bidb * batch_stride : uint32_t(sum_s_k) * row_stride;
     }
 
-    const int sum_s_q;
-    const int sum_s_k;
-    const int actual_seqlen_q;
+    int sum_s_q;
+    int sum_s_k;
+    int actual_seqlen_q;
     // We have to have seqlen_k_cache declared before actual_seqlen_k, otherwise actual_seqlen_k is set to 0.
-    const int seqlen_k_cache;
-    const int actual_seqlen_k;
+    int seqlen_k_cache;
+    int actual_seqlen_k;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
