@@ -157,16 +157,18 @@ struct Flash_fwd_params : public Qkv_params {
     bool is_prefill;
     int ngroups;
 
-    int *num_remain_seqs_ptr;
+    int max_iterations;
+    float threshold;
+    int *num_finish_seqs;
     float *es_acc;
     float *es_min;
-    float threshold;
     int *total_seq_lens;
     int block_chunk_size;
     volatile int *seq_states;
+    volatile int *buffer_states;
+    volatile int *compute_iteration_cnt;
     int *barrier1;
     int *barrier2;
-    int iteration;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

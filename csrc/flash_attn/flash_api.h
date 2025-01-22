@@ -66,7 +66,6 @@ mha_fwd_kvcache_multiple(at::Tensor &q,                 // batch_size x seqlen_q
                          int *total_seq_lens,
                          int block_chunk_size,
                          float threshold,
-                         std::atomic<int> &load_budget,
-                         std::atomic<int> &compute_budget,
                          volatile int *seq_states,
-                         volatile int *compute_iteration);
+                         volatile int *compute_iteration_cnt,
+                         volatile int *buffer_states);

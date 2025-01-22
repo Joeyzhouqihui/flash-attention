@@ -495,7 +495,7 @@ inline __device__ void process_es_kernel(const Params &params, int iteration) {
     const int block_size = params.page_block_size;
     float *softmax_lse = reinterpret_cast<float*>(params.softmax_lse_ptr_list[iteration]);
     float *es = reinterpret_cast<float*>(params.attn_weights_ptr);
-    int *num_remain_seqs_ptr = params.num_remain_seqs_ptr;
+    int *num_finish_seqs = params.num_finish_seqs;
     float *es_acc = params.es_acc;
     float *es_min = params.es_min;
     int *total_seq_lens = params.total_seq_lens;
@@ -515,7 +515,8 @@ inline __device__ void process_es_kernel(const Params &params, int iteration) {
     const int num_blocks_left = num_blocks_total - (iteration + 1) * block_chunk_size;
     if (num_blocks_left <= 0) {
       if (thread_idx == 0) {
-        params.seq_states[seq_idx] = 0;
+        *(seq_states + seq_idx) = 0;
+        atomicAdd((int *)num_finish_seqs, 1);
       }
       return;
     }
@@ -555,7 +556,8 @@ inline __device__ void process_es_kernel(const Params &params, int iteration) {
         total_ptg += sm_ptg[idx];
       }
       if (total_ptg / num_heads >= params.threshold) {
-        seq_states[seq_idx] = 0;
+        *(seq_states + seq_idx) = 0;
+        atomicAdd((int *)num_finish_seqs, 1);
       }
       // printf("iteration: %d, ptg: %f, threshold: %f\n", iteration, (total_ptg / num_heads), threshold);
     }
@@ -2155,21 +2157,34 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
     const int num_thread_blocks = gridDim.x * gridDim.y * gridDim.z;
     volatile int *barrier1 = params.barrier1;
     volatile int *barrier2 = params.barrier2;
-    int iteration = params.iteration;
-    if (thread_idx == 0) {
-        while ((*barrier1) < iteration * params.b); // sync
-    }
-    __syncthreads();
-    flash::compute_attn_1rowblock_splitkv_iteration<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits, iteration);
-    if (thread_idx == 0) {
-        atomicAdd((int *)barrier2, 1);
-        while ((*barrier2) < (iteration + 1) * num_thread_blocks); // sync
-    }
-    __syncthreads();
-    if (thread_block_idx < params.b) {
-        flash::process_es_kernel(params, iteration);
+    volatile int *num_finish_seqs = params.num_finish_seqs;
+    for (int iteration = 0; iteration < params.max_iterations; iteration++) {
+        if (thread_idx == 0) { // sync
+            while ((*barrier1) < iteration * params.b);
+        }
+        __syncthreads();
+        if ((*num_finish_seqs) >= params.b) { // finish
+            return;
+        }
+        if (thread_idx == 0) { // wait data loading
+            while (*(params.buffer_states + iteration) == 0);
+            if (thread_block_idx == 0) {
+                atomicAdd((int *)params.compute_iteration_cnt, 1);
+            }
+        }
+        __syncthreads();
+        flash::compute_attn_1rowblock_splitkv_iteration<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits, iteration);
         if (thread_idx == 0) {
-            atomicAdd((int *)barrier1, 1);
+            atomicAdd((int *)barrier2, 1);
+            while (*barrier2 < (iteration + 1) * num_thread_blocks); // sync
+        }
+        __syncthreads();
+        if (thread_block_idx < params.b) {
+            flash::process_es_kernel(params, iteration);
+            if (thread_idx == 0) {
+                atomicAdd((int *)barrier1, 1);
+                printf("iteration: %d, num_finished_seqs: %d\n", iteration, *num_finish_seqs);
+            }
         }
     }
 }
