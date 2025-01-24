@@ -165,10 +165,12 @@ struct Flash_fwd_params : public Qkv_params {
     int *total_seq_lens;
     int block_chunk_size;
     volatile int *seq_states;
+    volatile int *seq_states_gpu;
     volatile int *buffer_states;
     volatile int *compute_iteration_cnt;
-    int *barrier1;
-    int *barrier2;
+    int *load_barrier;
+    int *compute_barrier;
+    int *verify_barrier;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

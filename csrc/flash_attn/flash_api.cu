@@ -219,18 +219,21 @@ void set_params_splitkv(Flash_fwd_params &params, const int batch_size,
     const int num_m_blocks = (max_seqlen_q + 64 - 1) / 64;
     params.num_splits = num_splits;
     if (p_dropout == 0.0f) {  // SplitKV is not implemented for dropout
-        // if (num_splits < 1) {
-        //     // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
-        //     params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, dprops->multiProcessorCount * 2, num_n_blocks, 128);
-        // }
-        // if (params.num_splits > 1) {
-        //     at::Tensor softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
-        //     at::Tensor out_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q, head_size_rounded}, opts.dtype(at::kFloat));
-        //     params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
-        //     params.oaccum_ptr = out_accum.data_ptr();
-        // }
-        // TORCH_CHECK(params.num_splits <= 128, "num_splits > 128 not supported");
-        params.num_splits = 1;
+        if (params.max_iterations > 0) {
+            params.num_splits = 1;
+        } else {
+            if (num_splits < 1) {
+                // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
+                params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, dprops->multiProcessorCount * 2, num_n_blocks, 128);
+            }
+            if (params.num_splits > 1) {
+                at::Tensor softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
+                at::Tensor out_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q, head_size_rounded}, opts.dtype(at::kFloat));
+                params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
+                params.oaccum_ptr = out_accum.data_ptr();
+            }
+        }
+        TORCH_CHECK(params.num_splits <= 128, "num_splits > 128 not supported");
     }
 }
 
@@ -486,6 +489,7 @@ mha_fwd_kvcache(at::Tensor &old_q,                  // batch_size x seqlen_q x n
         params.cache_batch_idx = reinterpret_cast<int *>(cache_batch_idx.data_ptr());
     }
 
+    params.max_iterations = 0;
     set_params_splitkv(params, batch_size, num_heads,
                        head_size, seqlen_k, seqlen_q,
                        head_size_rounded, /*dropout*/0.f, num_splits, dprops, opts);
@@ -727,6 +731,8 @@ mha_fwd_kvcache_multiple(at::Tensor &old_q,                  // batch_size x seq
         params.cache_batch_idx = reinterpret_cast<int *>(cache_batch_idx.data_ptr());
     }
 
+    int max_iterations = block_table_list_.size(0);
+    params.max_iterations = max_iterations;
     set_params_splitkv(params, batch_size, num_heads,
                        head_size, seqlen_k, seqlen_q,
                        head_size_rounded, /*dropout*/0.f, num_splits, dprops, opts);
@@ -739,11 +745,7 @@ mha_fwd_kvcache_multiple(at::Tensor &old_q,                  // batch_size x seq
 
     // Only split kernel supports appending to KV cache, or indexing to the cache with cache_batch_idx,
     // or paged KV cache
-    int max_iterations = block_table_list_.size(0);
-    params.max_iterations = max_iterations;
     params.threshold = threshold;
-    at::Tensor num_finish_seqs_tensor = torch::zeros({1}, opts.dtype(torch::kInt32));
-    params.num_finish_seqs = reinterpret_cast<int*>(num_finish_seqs_tensor.data_ptr());
     params.es_acc = es_acc;
     params.es_min = es_min;
     params.total_seq_lens = total_seq_lens;
@@ -751,26 +753,35 @@ mha_fwd_kvcache_multiple(at::Tensor &old_q,                  // batch_size x seq
     params.seq_states = seq_states;
     params.buffer_states = buffer_states;
     params.compute_iteration_cnt = compute_iteration_cnt;
-    at::Tensor barrier_tensor1 = torch::zeros({1}, opts.dtype(torch::kInt32));
-    params.barrier1 = reinterpret_cast<int*>(barrier_tensor1.data_ptr());
-    at::Tensor barrier_tensor2 = torch::zeros({1}, opts.dtype(torch::kInt32));
-    params.barrier2 = reinterpret_cast<int*>(barrier_tensor2.data_ptr());
+    at::Tensor num_finish_seqs_tensor = torch::zeros({1}, opts.dtype(torch::kInt32));
+    params.num_finish_seqs = reinterpret_cast<int*>(num_finish_seqs_tensor.data_ptr());
+    at::Tensor seq_states_tensor = torch::ones({batch_size}, opts.dtype(torch::kInt32));
+    params.seq_states_gpu = reinterpret_cast<int*>(seq_states_tensor.data_ptr());
+    at::Tensor barrier_tensor = torch::zeros({3}, opts.dtype(torch::kInt32));
+    int *barrier_ptr = reinterpret_cast<int*>(barrier_tensor.data_ptr());
+    params.load_barrier = barrier_ptr;
+    params.compute_barrier = barrier_ptr + 1;
+    params.verify_barrier = barrier_ptr + 2;
+    char *out_list_ptr = reinterpret_cast<char*>(out_list_.data_ptr());
+    int out_bytes = out_list_.stride(0) * out_list_.element_size();
+    char *out_es_sum_list_ptr = reinterpret_cast<char*>(out_es_sum_list_.data_ptr());
+    int out_es_sum_bytes = out_es_sum_list_.stride(0) * out_es_sum_list_.element_size();
+    char *seqlens_k_list_ptr = reinterpret_cast<char*>(seqlens_k_list_.data_ptr());
+    int seqlens_k_bytes = seqlens_k_list_.stride(0) * seqlens_k_list_.element_size();
+    char *block_table_list_ptr = reinterpret_cast<char*>(block_table_list_.data_ptr());
+    int block_table_bytes = block_table_list_.stride(0) * block_table_list_.element_size();
     for (int iteration = 0; iteration < max_iterations; iteration++) {
-        at::Tensor out = out_list_[iteration];
-        if (seqlenq_ngroups_swapped) {
-            out = out.reshape({batch_size, num_heads, seqlen_q, head_size_og}).transpose(1, 2);
-        }
-        params.o_ptr_list[iteration] = out.data_ptr();
-        at::Tensor softmax_lse = out_es_sum_list_[iteration];
-        softmax_lse = softmax_lse.reshape({batch_size, num_heads, seqlen_q});
-        params.softmax_lse_ptr_list[iteration] = softmax_lse.data_ptr();
-        at::Tensor seqlens_k = seqlens_k_list_[iteration];
-        params.cu_seqlens_k_list[iteration] = reinterpret_cast<int*>(seqlens_k.data_ptr());
-        at::Tensor block_table = block_table_list_[iteration];
-        params.block_table_list[iteration] = reinterpret_cast<int*>(block_table.data_ptr());
+        params.o_ptr_list[iteration] = out_list_ptr + out_bytes * iteration;
+        params.softmax_lse_ptr_list[iteration] = out_es_sum_list_ptr + out_es_sum_bytes * iteration;
+        params.cu_seqlens_k_list[iteration] = reinterpret_cast<int*>(seqlens_k_list_ptr + seqlens_k_bytes * iteration);
+        params.block_table_list[iteration] = reinterpret_cast<int*>(block_table_list_ptr + block_table_bytes * iteration);
     }
+    printf("batch size: %d\n", params.b);
     run_mha_fwd(params, stream, /*force_split_kernel=*/k_.has_value() || cache_batch_idx_.has_value() || paged_KV);
     cudaStreamSynchronize(stream);
-    std::cout<<num_finish_seqs_tensor<<std::endl;
-    printf("max iteration: %d, iteration: %d\n", max_iterations, (*compute_iteration_cnt));
+    printf("finish batch size: %d\n", params.b);
+    // for (int i=0; i<params.b; i++) {
+    //     printf("seq state: %d\n", *(seq_states + i));
+    // }
+    // printf("max iteration: %d, iteration: %d\n", max_iterations, (*compute_iteration_cnt));
 }
